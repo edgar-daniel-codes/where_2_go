@@ -1,0 +1,238 @@
+# .gitignore template for a general DS project 
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors 
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.iml
+*.code-workspace
+.vim/
+*.swp
+*~
+
+# Python 
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pyre/
+.pytype/
+.tox/
+.venv/
+venv/
+.env/          
+.ipynb_checkpoints/
+
+# R
+.Rhistory
+.Rproj.user/
+.RData
+.Ruserdata
+*.Rproj
+
+# Node 
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+
+# JAVA-Scala
+target/
+*.class
+.gradle/
+build/
+out/
+.gradle/
+
+# Android (if apply)
+.cxx/
+.local.properties
+
+# C++
+bin/
+obj/
+target/   
+Cargo.lock
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IOs
+DerivedData/
+.build/
+*.xcuserdatad/
+*.xcworkspace/xcuserdata/
+
+# Julia
+.julia/compiled/
+.julia/logs/
+
+# Avoiding data dumps 
+data/raw/**
+data/inference/**
+data/clean/index_**
+data/bronze/**
+data/gold/**
+data/silver/**
+data/processed/**
+data/geodata/**
+
+# Just sample data or required 
+!data/**/.gitkeep
+!data/samples/**
+!data/clean/loads/**
+
+# Bulk binaries 
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.arrow
+*.orc
+!*.pkl
+*.joblib
+*.rds
+*.rda
+*.sav
+*.dta
+*.mat
+*.pt
+*.onnx
+*.pb
+*.tflite
+*.ckpt
+*.bin
+
+# Logs
+*.log
+logs/
+*.out
+*.err
+*.pid
+*.dump
+*.sql
+*.sqlite*
+*.db
+
+# Cache 
+dist/
+build/
+.eggs/
+*.egg
+.cache/
+cache/
+__pypackages__/
+site/
+coverage/
+pytestdebug.log
+
+# Secrets
+# Environment & dotenv
+.env
+.env.*
+.envrc
+*.env
+
+# Generic secrets
+*.secret
+*.secrets.*
+secrets/**
+secret/**
+*.key
+*.pem
+*.cer
+*.crt
+*.pfx
+*.p12
+*.jks
+*.keystore
+*.der
+*.csr
+
+# Cloud & service creds
+*.aws.json
+.aws/
+*.gcloud.json
+gcloud-service-key.json
+*.azureauth
+kubeconfig
+.kube/
+*.sa.json
+*.serviceaccount.json
+firebase*.json
+*.rclone.conf
+
+# App credential
+credentials.json
+client_secret.json
+oauth_client*.json
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.pub
+
+# Terraform 
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+
+# Docker 
+.docker/
+docker-compose.override.yml
+*.env.docker.local
+
+# CI/CD artifacts 
+.gitlab-runner/
+.github/*.secrets.yml
+
+# ---- Jupyter 
+*.nbconvert.ipynb
+*.ipynb_checkpoints/
+
+# Large files
+*.7z
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.bz2
+*.xz
+*.lz4
+*.zst
+
+# Quarto builds
+!./docs/
+!docs/_site/*
+docs/*.log
+docs/*.tmp
+
+
+# Keepers
+.gitkeep
+
