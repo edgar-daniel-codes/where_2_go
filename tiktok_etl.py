@@ -147,14 +147,15 @@ if __name__=="__main__":
             driver.quit()
 
         except:
+            logger.warning(f"Links search for {ht} failed.")
             driver.quit()
 
-        logger.info("Hashtag Exploration Ends --- ")
+    logger.info("Hashtag Exploration Ends --- ")
 
-        logger.info("Saving root file --- ")
-        df_raw = pd.DataFrame(results)
-        df_raw['level'] = 0
-        df_raw.to_csv(RAW_DATA + ROOT_FILE, index = False)
+    logger.info("Saving root file --- ")
+    df_raw = pd.DataFrame(results)
+    df_raw['level'] = 0
+    df_raw.to_csv(RAW_DATA + ROOT_FILE, index = False)
 
 
 
