@@ -26,6 +26,516 @@ from typing import List, Tuple, Dict
 ### ---------------------------------------------------------------------------------------------
 ### Text patterns -------------------------------------------------------------------------------
 
+
+import logging
+import re
+import unicodedata
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    # Python 3.9+
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
+
+
+# ---- Public API -------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EventOccurrence:
+    """Detected schedule/time occurrence inside free-form Spanish text."""
+    start: Optional[datetime]
+    end: Optional[datetime]
+    date_text: Optional[str]
+    time_text: Optional[str]
+    span: Tuple[int, int]
+    matched_text: str
+    confidence: float
+    labels: Tuple[str, ...]
+
+
+def extract_event_occurrences(
+    text: str,
+    *,
+    reference_dt: Optional[datetime] = None,
+    timezone: str = "America/Mexico_City",
+    max_results: int = 50,
+    logger: Optional[logging.Logger] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Production-grade extractor for Spanish schedule/time occurrences in long text.
+
+    What it detects (examples):
+      - Relative dates: "hoy", "mañana", "pasado mañana"
+      - Weekdays: "este viernes", "próximo lunes"
+      - Explicit dates: "12/01", "12-01-2026", "12 de enero", "12 ene 2026"
+      - Times: "8", "8 pm", "20:30", "a las 7:15", "7pm", "19 hrs", "mediodía"
+      - Ranges: "de 8 a 10", "8-10 pm", "19:00 a 22:00"
+      - Icons: ⏰ 🕒 ⌚ 📅 🗓️
+
+    Returns:
+      List of dicts (serializable) with start/end datetimes (timezone-aware when possible),
+      plus raw matched text, span, confidence, and labels.
+
+    Notes:
+      - If a date is found without a time, start/end are set to midnight (00:00) with low confidence.
+      - If a time is found without a date, date defaults to reference_dt.date() with low confidence.
+      - Parsing is heuristic but robust; designed for social/event descriptions in Spanish.
+    """
+    log = logger or logging.getLogger(__name__)
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    ref = reference_dt or datetime.now(_get_tz(timezone))
+    tz = _get_tz(timezone)
+
+    norm_text = _normalize_text(text)
+    candidates = _find_candidate_spans(text, norm_text)
+
+    occurrences: List[EventOccurrence] = []
+    for (s, e, labels) in candidates:
+        snippet = text[s:e]
+        snippet_norm = norm_text[s:e]
+
+        date_dt, date_text, date_conf = _parse_date(snippet_norm, ref, tz)
+        t_start, t_end, time_text, time_conf = _parse_time_range(snippet_norm, ref, tz)
+
+        start_dt, end_dt, conf, out_labels = _compose_datetimes(
+            ref=ref,
+            tz=tz,
+            date_dt=date_dt,
+            date_text=date_text,
+            date_conf=date_conf,
+            t_start=t_start,
+            t_end=t_end,
+            time_text=time_text,
+            time_conf=time_conf,
+            labels=labels,
+        )
+
+        if start_dt is None and end_dt is None and not (date_text or time_text):
+            continue
+
+        occurrences.append(
+            EventOccurrence(
+                start=start_dt,
+                end=end_dt,
+                date_text=date_text,
+                time_text=time_text,
+                span=(s, e),
+                matched_text=snippet.strip(),
+                confidence=conf,
+                labels=tuple(sorted(out_labels)),
+            )
+        )
+
+        if len(occurrences) >= max_results:
+            log.info("Reached max_results=%s while extracting occurrences.", max_results)
+            break
+
+    # De-duplicate by (start,end,matched_text simplified)
+    occurrences = _dedupe_occurrences(occurrences)
+
+    # Sort by start datetime (unknowns last)
+    occurrences.sort(key=lambda o: (o.start is None, o.start or ref, o.confidence), reverse=False)
+
+    return [asdict(o) for o in occurrences]
+
+
+# ---- Internals --------------------------------------------------------------
+
+_TIME_ICONS = r"[⏰🕒⌚🕰️⏱️📅🗓️🗒️]"
+_PLACE_ICONS = r"[📍🗺️]"
+_EVENT_HINTS = (
+    "evento", "concierto", "rave", "fiesta", "festival", "show", "presentacion", "presentación",
+    "funcion", "función", "taller", "charla", "meetup", "reunion", "reunión", "clase",
+    "boletos", "tickets", "cover", "entrada", "abrimos", "apertura", "closing", "lineup",
+)
+_DATE_HINTS = (
+    "hoy", "manana", "mañana", "pasado manana", "pasado mañana", "este", "esta", "proximo",
+    "próximo", "siguiente", "viernes", "sabado", "sábado", "domingo", "lunes", "martes",
+    "miercoles", "miércoles", "jueves",
+    "ene", "enero", "feb", "febrero", "mar", "marzo", "abr", "abril", "may", "mayo",
+    "jun", "junio", "jul", "julio", "ago", "agosto", "sep", "sept", "septiembre",
+    "oct", "octubre", "nov", "noviembre", "dic", "diciembre",
+)
+_TIME_HINTS = (
+    "a las", "alas", "hora", "horas", "hrs", "hr", "h", "pm", "am", "medio dia", "mediodia",
+    "medianoche",
+)
+
+
+_MONTHS = {
+    "ene": 1, "enero": 1,
+    "feb": 2, "febrero": 2,
+    "mar": 3, "marzo": 3,
+    "abr": 4, "abril": 4,
+    "may": 5, "mayo": 5,
+    "jun": 6, "junio": 6,
+    "jul": 7, "julio": 7,
+    "ago": 8, "agosto": 8,
+    "sep": 9, "sept": 9, "septiembre": 9,
+    "oct": 10, "octubre": 10,
+    "nov": 11, "noviembre": 11,
+    "dic": 12, "diciembre": 12,
+}
+
+_WEEKDAYS = {
+    "lunes": 0,
+    "martes": 1,
+    "miercoles": 2, "miércoles": 2,
+    "jueves": 3,
+    "viernes": 4,
+    "sabado": 5, "sábado": 5,
+    "domingo": 6,
+}
+
+
+def _get_tz(tz_name: str):
+    if ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return None
+
+
+def _normalize_text(text: str) -> str:
+    # Keep original length alignment as much as possible:
+    # - Lowercase
+    # - Normalize accents to ASCII while preserving string length by replacing accented letters
+    #   with their base form (best-effort). This is good enough for regex anchoring spans.
+    lowered = text.lower()
+
+    # Replace common multi-codepoint emoji variants to single placeholders (length may change slightly,
+    # but we don't use normalized spans for returning; we keep spans from original).
+    lowered = lowered.replace("\uFE0F", "")
+
+    # Remove accents
+    nfkd = unicodedata.normalize("NFKD", lowered)
+    return "".join([c for c in nfkd if not unicodedata.combining(c)])
+
+
+def _find_candidate_spans(text: str, norm_text: str) -> List[Tuple[int, int, Tuple[str, ...]]]:
+    """
+    Identify likely spans containing schedule/time info.
+    Returns spans in original text indices.
+    """
+    spans: List[Tuple[int, int, Tuple[str, ...]]] = []
+
+    # 1) Explicit icon-driven spans (usually near the relevant info)
+    icon_pat = re.compile(rf"({_TIME_ICONS}|{_PLACE_ICONS})")
+    for m in icon_pat.finditer(text):
+        s = max(0, m.start() - 80)
+        e = min(len(text), m.end() + 120)
+        spans.append((s, e, ("icon",)))
+
+    # 2) Date/time formats and keywords
+    keyword_pat = re.compile(
+        r"("
+        r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b"                  # 12/01, 12-01-2026
+        r"|"
+        r"\b\d{1,2}\s+de\s+[a-z]{3,10}(\s+\d{4})?\b"             # 12 de enero 2026
+        r"|"
+        r"\b(hoy|manana|mañana|pasado\s+manana|pasado\s+mañana)\b"
+        r"|"
+        r"\b(este|esta|proximo|próximo|siguiente)\s+(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b"
+        r"|"
+        r"\b(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b"
+        r"|"
+        r"\b\d{1,2}(:\d{2})?\s*(am|pm)?\b"                       # 8, 8pm, 20:30
+        r"|"
+        r"\b(a\s*las\s*)?\d{1,2}(:\d{2})?\s*(hrs|hr|h)\b"        # a las 19 hrs
+        r"|"
+        r"\b(mediodia|medio\s+dia|medianoche)\b"
+        r")"
+    )
+    for m in keyword_pat.finditer(norm_text):
+        s = max(0, m.start() - 90)
+        e = min(len(text), m.end() + 140)
+        spans.append((s, e, ("keyword",)))
+
+    # 3) Event-hints (broadened window; schedule often appears near them)
+    hints = "|".join(sorted(set(_EVENT_HINTS), key=len, reverse=True))
+    if hints:
+        event_pat = re.compile(rf"\b({hints})\b", re.IGNORECASE)
+        for m in event_pat.finditer(norm_text):
+            s = max(0, m.start() - 120)
+            e = min(len(text), m.end() + 220)
+            spans.append((s, e, ("event_hint",)))
+
+    # Merge overlapping spans
+    spans.sort(key=lambda x: (x[0], x[1]))
+    merged: List[Tuple[int, int, Tuple[str, ...]]] = []
+    for s, e, labels in spans:
+        if not merged:
+            merged.append((s, e, labels))
+            continue
+        ps, pe, pl = merged[-1]
+        if s <= pe:
+            merged[-1] = (ps, max(pe, e), tuple(sorted(set(pl + labels))))
+        else:
+            merged.append((s, e, labels))
+
+    return merged
+
+
+def _parse_date(snippet_norm: str, ref: datetime, tz) -> Tuple[Optional[datetime], Optional[str], float]:
+    """
+    Returns (date_dt at 00:00, date_text, confidence).
+    """
+    s = snippet_norm
+
+    # Relative: hoy/mañana/pasado mañana
+    rel_pat = re.compile(r"\b(hoy|manana|mañana|pasado\s+manana|pasado\s+mañana)\b")
+    m = rel_pat.search(s)
+    if m:
+        key = m.group(1).replace("mañana", "manana")
+        if key == "hoy":
+            d = ref.date()
+            return _make_dt(d.year, d.month, d.day, 0, 0, tz), m.group(1), 0.78
+        if key == "manana":
+            d = (ref + timedelta(days=1)).date()
+            return _make_dt(d.year, d.month, d.day, 0, 0, tz), m.group(1), 0.75
+        if key == "pasado manana":
+            d = (ref + timedelta(days=2)).date()
+            return _make_dt(d.year, d.month, d.day, 0, 0, tz), m.group(1), 0.75
+
+    # Weekday with modifiers
+    wd_mod_pat = re.compile(
+        r"\b(este|esta|proximo|próximo|siguiente)\s+"
+        r"(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b"
+    )
+    m = wd_mod_pat.search(s)
+    if m:
+        target = m.group(2)
+        dt = _next_weekday(ref, _weekday_index(target), force_next=True)
+        return _make_dt(dt.year, dt.month, dt.day, 0, 0, tz), m.group(0), 0.72
+
+    # Plain weekday (assume next occurrence, including today if time hasn't passed is unknown -> choose next)
+    wd_pat = re.compile(r"\b(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b")
+    m = wd_pat.search(s)
+    if m:
+        target = m.group(1)
+        dt = _next_weekday(ref, _weekday_index(target), force_next=False)
+        return _make_dt(dt.year, dt.month, dt.day, 0, 0, tz), m.group(1), 0.62
+
+    # dd/mm(/yyyy) or dd-mm(/yyyy)
+    num_date_pat = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b")
+    m = num_date_pat.search(s)
+    if m:
+        d = int(m.group(1))
+        mo = int(m.group(2))
+        y_raw = m.group(3)
+        y = _coerce_year(y_raw, ref.year)
+        if _valid_ymd(y, mo, d):
+            return _make_dt(y, mo, d, 0, 0, tz), m.group(0), 0.90
+
+    # "12 de enero (2026)"
+    long_date_pat = re.compile(r"\b(\d{1,2})\s+de\s+([a-z]{3,10})(?:\s+(\d{4}))?\b")
+    m = long_date_pat.search(s)
+    if m:
+        d = int(m.group(1))
+        mo_key = m.group(2)
+        y = int(m.group(3)) if m.group(3) else ref.year
+        mo = _MONTHS.get(mo_key[:4], _MONTHS.get(mo_key, 0))
+        if mo and _valid_ymd(y, mo, d):
+            return _make_dt(y, mo, d, 0, 0, tz), m.group(0), 0.92
+
+    return None, None, 0.0
+
+
+def _parse_time_range(snippet_norm: str, ref: datetime, tz) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]], Optional[str], float]:
+    """
+    Returns (start_hm, end_hm, time_text, confidence).
+    start_hm/end_hm are (hour, minute) tuples.
+    """
+    s = snippet_norm
+
+    # "mediodia / medianoche"
+    m = re.search(r"\b(mediodia|medio\s+dia|medianoche)\b", s)
+    if m:
+        if "medianoche" in m.group(1):
+            return (0, 0), None, m.group(1), 0.70
+        return (12, 0), None, m.group(1), 0.70
+
+    # Time range "de 8 a 10", "8-10 pm", "19:00 a 22:00"
+    range_pat = re.compile(
+        r"\b(?:de\s+)?"
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*"
+        r"(?:a|hasta|-|–)\s*"
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b"
+    )
+    m = range_pat.search(s)
+    if m:
+        h1, mi1, ap1 = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+        h2, mi2, ap2 = int(m.group(4)), int(m.group(5) or 0), m.group(6)
+
+        # If only one am/pm is provided, propagate.
+        if ap1 and not ap2:
+            ap2 = ap1
+        if ap2 and not ap1:
+            ap1 = ap2
+
+        h1 = _apply_ampm(h1, ap1)
+        h2 = _apply_ampm(h2, ap2)
+
+        if _valid_hm(h1, mi1) and _valid_hm(h2, mi2):
+            return (h1, mi1), (h2, mi2), m.group(0), 0.92
+
+    # Single time: "a las 7:15", "20:30", "8pm", "19 hrs"
+    single_pat = re.compile(
+        r"\b(?:a\s*las\s*)?"
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:hrs|hr|h)?\b"
+    )
+    m = single_pat.search(s)
+    if m:
+        h, mi, ap = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+        h = _apply_ampm(h, ap)
+        if _valid_hm(h, mi):
+            conf = 0.85 if (":" in m.group(0) or ap) else 0.62  # "8" alone is ambiguous
+            return (h, mi), None, m.group(0), conf
+
+    return None, None, None, 0.0
+
+
+def _compose_datetimes(
+    *,
+    ref: datetime,
+    tz,
+    date_dt: Optional[datetime],
+    date_text: Optional[str],
+    date_conf: float,
+    t_start: Optional[Tuple[int, int]],
+    t_end: Optional[Tuple[int, int]],
+    time_text: Optional[str],
+    time_conf: float,
+    labels: Tuple[str, ...],
+) -> Tuple[Optional[datetime], Optional[datetime], float, Tuple[str, ...]]:
+    out_labels = set(labels)
+
+    # If neither date nor time: no usable schedule.
+    if date_dt is None and t_start is None:
+        return None, None, 0.0, tuple(out_labels)
+
+    # Default missing date to ref.date (low confidence)
+    base_date = (date_dt.date() if date_dt else ref.date())
+    if date_dt is None:
+        out_labels.add("date_imputed")
+
+    # Default missing time to 00:00 (very low confidence)
+    if t_start is None:
+        out_labels.add("time_missing")
+        start_dt = _make_dt(base_date.year, base_date.month, base_date.day, 0, 0, tz)
+        end_dt = None
+        conf = 0.35 + 0.40 * date_conf  # mostly date-driven
+        return start_dt, end_dt, min(conf, 0.75), tuple(out_labels)
+
+    start_dt = _make_dt(base_date.year, base_date.month, base_date.day, t_start[0], t_start[1], tz)
+    end_dt = None
+
+    if t_end is not None:
+        end_dt = _make_dt(base_date.year, base_date.month, base_date.day, t_end[0], t_end[1], tz)
+        # If end < start, assume crosses midnight -> add 1 day
+        if end_dt < start_dt:
+            end_dt = end_dt + timedelta(days=1)
+            out_labels.add("crosses_midnight")
+
+    # Confidence fusion
+    conf = 0.25 + 0.45 * max(date_conf, 0.25 if date_dt else 0.10) + 0.45 * time_conf
+    conf = max(0.05, min(conf, 0.99))
+
+    # Label if explicit icon present (helps)
+    if "icon" in out_labels:
+        conf = min(0.99, conf + 0.03)
+
+    return start_dt, end_dt, conf, tuple(out_labels)
+
+
+def _dedupe_occurrences(items: List[EventOccurrence]) -> List[EventOccurrence]:
+    seen = set()
+    out: List[EventOccurrence] = []
+    for o in items:
+        key = (
+            o.start.isoformat() if o.start else None,
+            o.end.isoformat() if o.end else None,
+            _normalize_text(o.matched_text)[:180],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(o)
+    return out
+
+
+def _make_dt(y: int, mo: int, d: int, h: int, mi: int, tz):
+    dt = datetime(y, mo, d, h, mi)
+    if tz is not None:
+        return dt.replace(tzinfo=tz)
+    return dt  # naive fallback
+
+
+def _weekday_index(wd: str) -> int:
+    return _WEEKDAYS[wd]
+
+
+def _next_weekday(ref: datetime, target_weekday: int, *, force_next: bool) -> datetime:
+    """
+    If force_next: always returns next week's instance if same weekday.
+    Otherwise returns same weekday if it's today (useful when time exists elsewhere),
+    else next occurrence.
+    """
+    current = ref.weekday()
+    delta = (target_weekday - current) % 7
+    if force_next and delta == 0:
+        delta = 7
+    if not force_next and delta == 0:
+        return ref
+    return ref + timedelta(days=delta)
+
+
+def _coerce_year(y_raw: Optional[str], default_year: int) -> int:
+    if not y_raw:
+        return default_year
+    y = int(y_raw)
+    if y < 100:
+        # 2-digit years: assume 2000-2099
+        return 2000 + y
+    return y
+
+
+def _apply_ampm(hour: int, ampm: Optional[str]) -> int:
+    if ampm is None:
+        return hour
+    ap = ampm.lower()
+    if ap == "am":
+        if hour == 12:
+            return 0
+        return hour
+    if ap == "pm":
+        if hour < 12:
+            return hour + 12
+        return hour
+    return hour
+
+
+def _valid_hm(h: int, m: int) -> bool:
+    return 0 <= h <= 23 and 0 <= m <= 59
+
+
+def _valid_ymd(y: int, mo: int, d: int) -> bool:
+    try:
+        datetime(y, mo, d)
+        return True
+    except ValueError:
+        return False
+
+
+
+
+
 # -----------------------------
 # Data structure
 # -----------------------------
@@ -302,7 +812,8 @@ DEFAULT_CITY_TOKENS = [
 # Keywords that strongly indicate a location mention nearby
 LOCATION_CUES = [
     r"direcci[oó]n", r"ubicaci[oó]n", r"est[aá]\s+en", r"queda\s+en", r"estamos\s+en",
-    r"nos\s+vemos\s+en", r"visita", r"ven\s+a", r"en\b", r"por\b", r"sobre\b"
+    r"nos\s+vemos\s+en", r"visita", r"ven\s+a", r"en\b", r"por\b", r"sobre\b", r"explora"
+    r"descubre"
 ]
 
 # Emoji anchors often used in captions
@@ -347,7 +858,7 @@ CUE_LOCATION_RE = re.compile(
     )
     \s*[:\-]?\s*
     (?P<loc>
-        [^\n\.;!\?]{{3,120}}                   # capture until hard punctuation
+        [^\n\.;!\?\|]{{3,120}}                   # capture until hard punctuation
     )
     """,
     re.IGNORECASE | re.VERBOSE
@@ -380,25 +891,7 @@ def detect_places(
 
     matches: List[PlaceMatch] = []
 
-    # Rule A: POI | CITY
-    for m in POI_CITY_RE.finditer(text):
-        poi = m.group("poi").strip(" -|,·—–")
-        city_raw = m.group("city").strip(" -|,·—–")
-
-        # Validate city with city lexicon if possible (otherwise accept)
-        kind = "POI"
-        if city_re.search(city_raw):
-            # Use the matched city token span instead of full city_raw if you prefer
-            kind = "POI"
-
-        matches.append(PlaceMatch(
-            text=f"{poi} | {city_raw}",
-            span=(m.start(), m.end()),
-            kind=kind,
-            rule="poi_city"
-        ))
-
-    # Rule B: cue-based location phrases
+    # Rule 1: cue-based location phrases
     for m in CUE_LOCATION_RE.finditer(text):
         loc = m.group("loc").strip(" ,|-")
         span = (m.start("loc"), m.end("loc"))
@@ -411,7 +904,26 @@ def detect_places(
 
         matches.append(PlaceMatch(text=loc, span=span, kind=kind, rule="cue_location"))
 
-    # Rule C: hashtag city (useful in reels captions)
+    # Rule 2: POI | CITY
+    for m in POI_CITY_RE.finditer(text):
+        poi = m.group("poi").strip(" -|,·—–")
+        city_raw = m.group("city").strip(" -|,·—–")
+
+        # Validate city with city lexicon if possible (otherwise accept)
+        kind = "POI"
+        if city_re.search(city_raw):
+            # Use the matched city token span instead of full city_raw if you prefer
+            kind = "POI"
+
+        matches.append(PlaceMatch(
+            text=f"{poi}",
+            span=(m.start(), m.end()),
+            kind=kind,
+            rule="poi_city"
+        ))
+
+
+    # Rule 3: hashtag city (useful in reels captions)
     for m in HASHTAG_CITY_RE.finditer(text):
         tag = m.group("city")
         # only keep if it matches a known city token (or common short codes)
@@ -445,8 +957,8 @@ def _dedupe_overlaps(matches: List[PlaceMatch]) -> List[PlaceMatch]:
             continue
         kept.append(m)
 
-    # Return in reading order
-    return sorted(kept, key=lambda x: x.span[0])
+    # Return in reading order by kind
+    return sorted(kept, key=lambda x: x.kind, reverse=True)
 
 
 
@@ -533,7 +1045,7 @@ def city_hashtags(city):
     events = [
         f"#evento #{city}",
         f"#eventos #{city}",
-        f"#{city}", f"#eventos{city}", f"#agenda{city}",
+        f"#eventos{city}", f"#agenda{city}",
         f"#rave #{city}", f"#rave{city}",
         f"#concierto #{city}", f"#concierto{city}",
         f"#festival #{city}", f"#festival{city}",
