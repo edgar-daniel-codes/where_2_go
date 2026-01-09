@@ -211,7 +211,7 @@ if __name__=="__main__":
             try:
                 raw = driver.find_element(
                 By.CSS_SELECTOR,
-                "div[class*='DivCustomTDKContainer']"
+                "div[class*='DivOverlayBottomContent']"
                 ).text
 
                 ia_disclaimer = "Esta información se generó por IA y puede presentar resultados que no son relevantes. No representa las opiniones o consejos de TikTok. Si tienes alguna duda, envíanosla a través de: Comentarios y ayuda: TikTok"
@@ -232,30 +232,9 @@ if __name__=="__main__":
                 # Get address label
 
                 # From caption 
-                if d !='':
-                    excat_add =  wm.extract_addresses(d, top_k=1, min_score=2.5)
-                    if len(excat_add) > 0:
-                        add_label =  excat_add[0].text
-                    else:
-                        if len(wm.detect_places(d))>0:
-                            add_label =  wm.detect_places(d)[0].text
-                        else:
-                            add_label = ''
-
-                # Fromn text description 
-                else:
-                    if desc_text != "":
-                        excat_add =  wm.extract_addresses(desc_text, top_k=1, min_score=2.5)
-                        if len(excat_add) > 0:
-                            add_label =  excat_add[0].text
-                        else:
-                            if len(wm.detect_places(desc_text))>0:
-                                add_label =  wm.detect_places(d)[0].text
-                            else:
-                                add_label = ''
-
-                    else:
-                        add_label = ""
+                if desc_text !='':
+                    res = wm.best_location_label_from_text(desc_text)
+                    add_label = res.label 
 
                 # Call API if we have label
                 if add_label != "":
