@@ -155,6 +155,7 @@ if __name__=="__main__":
     logger.info("Saving root file --- ")
     df_raw = pd.DataFrame(results)
     df_raw['level'] = 0
+    df_raw.drop_duplicates(subset=['href'])
     df_raw.to_csv(RAW_DATA + ROOT_FILE, index = False)
 
 
@@ -311,28 +312,6 @@ if __name__=="__main__":
     )
     .dropna(subset=['date_long'])
     )
-
-    # Get data 
-
-    # Todays videos labeled as today and formatred date column 
-    df.date_long = pd.to_datetime(df.date_long.apply(lambda x: 
-                    pd.to_datetime(dt.datetime.today()).strftime('%Y-%m-%d') if 'Hace' in x else x)
-                    , format='%Y-%m-%d')
-
-    # Auxilliar string date limit 
-    date_limit = pd.to_datetime(
-        dt.datetime.today()- dt.timedelta(days=DAYS_FRESHNESS)
-        ).strftime('%Y-%m-%d')
-
-    # Maintain just 'recent' posts 
-    df = df.query(f""" date_long > '{date_limit}'""")
-
-    # Drop no description assets 
-    df = df[~(df.description.isna() & df.long_description.isna())]
-
-    # Format incomplete row descriptions 
-    df['description'] = df['description'].fillna('')
-    df['long_description'] = df['long_description'].fillna('')
 
     # Saving file 
     df.to_csv(RAW_DATA + DAY_FILE, index = False)
