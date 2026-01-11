@@ -99,6 +99,9 @@ data/silver/**
 data/processed/**
 data/geodata/**
 
+# Deprecated files 
+deprecated/**
+
 # Just sample data or required 
 !data/**/.gitkeep
 !data/samples/**

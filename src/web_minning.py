@@ -20,7 +20,7 @@ import pandas as pd
 
 import re
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 
 ### ---------------------------------------------------------------------------------------------
@@ -534,192 +534,413 @@ def _valid_ymd(y: int, mo: int, d: int) -> bool:
 
 
 
+### ---------------------------------------------------------------------------------------------
+### Text patterns - Geo-indexing ----------------------------------------------------------------
 
 
-# -----------------------------
-# Data structure
-# -----------------------------
-@dataclass
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Pattern, Tuple
+
+
+# =========================
+# Data models
+# =========================
+
+@dataclass(frozen=True)
 class AddressMatch:
     text: str
     span: Tuple[int, int]
     score: float
-    rule: str  # which pattern matched (for debugging)
+    rule: str
 
 
-
-LOCATION_EMOJI = r"(?:📍|📌|🗺️|🧭|🏠|🏢|🏬|🏪|🏨|🏫|🏥)"
-
-
-# Lexicon / subpatterns (Spanish; tune for your city/country)
-
-STREET_TYPES = r"""
-(?:av(?:enida)?\.?|calle|c\.|blvd\.?|boulevard|paseo|calz\.?|calzada|circuito|privada|cerrada|
-carretera|camino|andador|prol\.?|prolongaci[oó]n|eje\s+(?:central|vial)|anillo|perif[eé]rico)
-""".strip()
-
-# "Name-like" chunk (street names, multi-token, supports accents and numbers)
-STREET_NAME = r"(?:[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9][A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\.\-']*(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\.\-']+)*)"
-
-# IMPORTANT: Escape '#' because we use re.VERBOSE
-NUM = r"(?:(?:\#\s*)?(?:\d{1,6})(?:\s*(?:bis|ter|a|b))?|s\/n|sin\s+n[uú]mero|sin\s+numero)"
-
-NEIGHBORHOOD = r"(?:col\.?|colonia|fracc\.?|fraccionamiento|barrio|unidad\s+habitacional|u\.h\.)"
-POSTAL = r"(?:c\.?p\.?\s*)?\b\d{5}\b"
-
-# Add your city-specific tokens here if you want better precision
-CITY_TOKENS = r"(?:cdmx|ciudad\s+de\s+m[eé]xico|mexico\s+d\.?f\.?|guadalajara|monterrey|puebla|quer[eé]taro)"
-
-# Secondary: cross street / between
-CROSS_WORDS = r"(?:esquina\s+con|esq\.?\s+con|entre)"
-
-# Optional unit/floor/building cues
-UNIT = r"(?:depto\.?|departamento|int\.?|interior|piso|torre|edif\.?|edificio|local|mz\.?|manzana|lote|km)\s*\w+"
-
-# Stop expansion at non-address areas (tune)
-STOP_RE = re.compile(
-    r"(?:\n|\b(?:tel|telefono|whats|precio|horario|hrs|instagram|ig|facebook|link|env[ií]os)\b|https?://)",
-    re.IGNORECASE
-)
+@dataclass(frozen=True)
+class PlaceMatch:
+    text: str
+    span: Tuple[int, int]
+    kind: str
+    rule: str
 
 
-# Patterns 
+@dataclass(frozen=True)
+class LocationLabelResult:
+    label: str
+    kind: str  # "ADDRESS" | "PLACE" | "NONE"
+    score: float
+    rule: str
+    span: Tuple[int, int]
 
-# 1) Street + name + number + optional tails
-CANDIDATE_RE = re.compile(
-    rf"""
-    (?P<cand>
-        \b{STREET_TYPES}\s+{STREET_NAME}\s+
-        (?:{NUM})
-        (?:
-            (?:\s*,\s*|\s+)
+
+# =========================
+# Language configuration
+# =========================
+
+@dataclass(frozen=True)
+class LanguageConfig:
+    """
+    Provide language-specific regex subpatterns and lexicons.
+    All fields are regex *fragments* unless explicitly noted.
+    """
+    language: str
+
+    # Emoji / icon anchors
+    location_emoji: str
+
+    # Address structure
+    street_types: str
+    street_name: str
+    num: str
+    neighborhood: str
+    postal: str
+    city_tokens: str
+    cross_words: str
+    unit: str
+
+    # Place detection (string tokens, not regex fragments)
+    city_token_list: Tuple[str, ...]
+    location_cues: Tuple[str, ...]
+
+    # Stop conditions for expansion
+    stop_re: Pattern
+
+
+def default_spanish_config() -> LanguageConfig:
+    location_emoji = r"(?:📍|📌|🗺️|🧭|🏠|🏢|🏬|🏪|🏨|🏫|🏥)"
+
+    street_types = r"""
+    (?:av(?:enida)?\.?|calle|c\.|blvd\.?|boulevard|paseo|calz\.?|calzada|circuito|privada|cerrada|
+    carretera|camino|andador|prol\.?|prolongaci[oó]n|eje\s+(?:central|vial)|anillo|perif[eé]rico)
+    """.strip()
+
+    street_name = (
+        r"(?:[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]"
+        r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\.\-']*"
+        r"(?:\s+[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\.\-']+)*)"
+    )
+
+    # IMPORTANT: Escape '#' because we use re.VERBOSE
+    num = r"(?:(?:\#\s*)?(?:\d{1,6})(?:\s*(?:bis|ter|a|b))?|s\/n|sin\s+n[uú]mero|sin\s+numero)"
+    neighborhood = r"(?:col\.?|colonia|fracc\.?|fraccionamiento|barrio|unidad\s+habitacional|u\.h\.)"
+    postal = r"(?:c\.?p\.?\s*)?\b\d{5}\b"
+    city_tokens = r"(?:cdmx|ciudad\s+de\s+m[eé]xico|mexico\s+d\.?f\.?|guadalajara|monterrey|puebla|quer[eé]taro)"
+    cross_words = r"(?:esquina\s+con|esq\.?\s+con|entre)"
+    unit = r"(?:depto\.?|departamento|int\.?|interior|piso|torre|edif\.?|edificio|local|mz\.?|manzana|lote|km)\s*\w+"
+
+    stop_re = re.compile(
+    r"(?:"
+    r"\n"
+    r"|\b(?:tel|telefono|whats|precio|horario|hrs|instagram|ig|facebook|link|env[ií]os)\b"
+    r"|https?://"
+    r")",
+    re.IGNORECASE,
+    )
+
+
+    city_token_list = (
+        "CDMX", "Ciudad de México", "México DF", "Mexico DF", "DF",
+        "Guadalajara", "GDL", "Monterrey", "MTY", "Puebla", "Querétaro", "Queretaro",
+        "Tijuana", "Mérida", "Merida", "Cancún", "Cancun", "Toluca",
+    )
+
+    location_cues = (
+        r"direcci[oó]n", r"ubicaci[oó]n", r"est[aá]\s+en", r"queda\s+en", r"estamos\s+en",
+        r"nos\s+vemos\s+en", r"visita", r"ven\s+a", r"en\b", r"por\b", r"sobre\b",
+        r"explora(?:\s+la)",
+        r"explora(?:\s+el)",
+        r"descubre",
+        r"direcci[oó]n",
+        r"ubicaci[oó]n",
+        r"domicilio",
+        r"vis[ií]tanos(?:\s+en)?",
+        r"visitenos(?:\s+en)?",
+        r"te\s+esperamos(?:\s+en)?",
+        r"nos\s+ubicamos(?:\s+en)?",
+        r"nos\s+encontramos(?:\s+en)?",
+        r"estamos(?:\s+en)?",
+        r"est[aá](?:\s+en)?",
+        r"queda(?:\s+en)?",
+        r"encu[eé]ntranos(?:\s+en)?",
+        r"encu[eé]ntra(?:\s+en)?",
+        r"ub[ií]canos(?:\s+en)?",
+        r"c[oó]mo\s+llegar(?:\s+a)?",
+        r"c[oó]mo\s+llegar(?:\s+al)?",
+        r"como\s+llegar(?:\s+al)?",
+        r"como\s+llegar(?:\s+a)?",
+        r"c[oó]mo\s+llego(?:\s+a)?",
+        r"como\s+llego(?:\s+a)?",
+        r"ruta(?:\s+a)?",
+        r"google\s+maps",
+        r"maps",
+        r"waze",
+        r"sucursal(?:\s+en)?",
+        r"nos\s+vemos\s+en",
+        r"visita",
+        r"ven\s+a",
+        r"pasa\s+por",
+        r"donde\s+est[aá]mos",
+        r"d[oó]nde\s+queda",
+        r"en\b",
+        r"por\b",
+        r"sobre\b",
+        r"cerca\s+de",
+        r"frente\s+a",
+        r"a\s+un\s+lado\s+de",
+        r"junto\s+a",
+        r"entre",
+        r"explora",
+        r"descubre",
+        r"parque",
+        r"patio",
+        r"jardin",
+        r"bosque",
+        r"lago",
+        r"laguna",
+        r"cascada",
+        r"playa",
+        r"selva",
+        r"reserva",
+        r"reserva\s+natural",
+        r"sendero",
+        r"mirador",
+        )
+
+    return LanguageConfig(
+        language="es",
+        location_emoji=location_emoji,
+        street_types=street_types,
+        street_name=street_name,
+        num=num,
+        neighborhood=neighborhood,
+        postal=postal,
+        city_tokens=city_tokens,
+        cross_words=cross_words,
+        unit=unit,
+        city_token_list=city_token_list,
+        location_cues=location_cues,
+        stop_re=stop_re,
+    )
+
+
+# =========================
+# Compiler helpers
+# =========================
+
+@dataclass
+class _CompiledPatterns:
+    # address patterns
+    street_number: Pattern
+    emoji_street_number: Pattern
+    cross_streets: Pattern
+    emoji_soft: Pattern
+
+    # place patterns
+    poi_city: Pattern
+    cue_location: Pattern
+    hashtag_city: Pattern
+
+    # city recognizer
+    city_re: Pattern
+
+
+_COMPILED_CACHE: Dict[str, _CompiledPatterns] = {}
+
+
+def _build_city_regex(city_tokens: List[str]) -> Pattern:
+    toks = sorted(city_tokens, key=len, reverse=True)
+    alts = "|".join(re.escape(t) for t in toks)
+    return re.compile(rf"\b(?:{alts})\b", re.IGNORECASE)
+
+
+def _compile_patterns(cfg: LanguageConfig) -> _CompiledPatterns:
+    if cfg.language in _COMPILED_CACHE:
+        return _COMPILED_CACHE[cfg.language]
+
+    # 1) Street + name + number + optional tails
+    street_number = re.compile(
+        rf"""
+        (?P<cand>
+            \b{cfg.street_types}\s+{cfg.street_name}\s+
+            (?:{cfg.num})
             (?:
-                {NEIGHBORHOOD}\s+{STREET_NAME}
-                |
-                {POSTAL}
-                |
-                {CITY_TOKENS}
-                |
-                {UNIT}
-                |
-                [A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\.\-']{{2,}}
-            )
-        ){{0,8}}
+                (?:\s*,\s*|\s+)
+                (?:
+                    {cfg.neighborhood}\s+{cfg.street_name}
+                    |
+                    {cfg.postal}
+                    |
+                    {cfg.city_tokens}
+                    |
+                    {cfg.unit}
+                    |
+                    [A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\.\-']{{2,}}
+                )
+            ){{0,8}}
+        )
+        """,
+        re.IGNORECASE | re.VERBOSE,
     )
-    """,
-    re.IGNORECASE | re.VERBOSE
-)
 
-# 2) Emoji + Street + name + number + optional tails
-EMOJI_CANDIDATE_RE = re.compile(
-    rf"""
-    (?P<cand>
-        {LOCATION_EMOJI}\s*
-        \b{STREET_TYPES}\s+{STREET_NAME}\s+
-        (?:{NUM})
-        (?:
-            (?:\s*,\s*|\s+)
+    # 2) Emoji + Street + name + number + optional tails
+    emoji_street_number = re.compile(
+        rf"""
+        (?P<cand>
+            {cfg.location_emoji}\s*
+            \b{cfg.street_types}\s+{cfg.street_name}\s+
+            (?:{cfg.num})
             (?:
-                {NEIGHBORHOOD}\s+{STREET_NAME}
-                |
-                {POSTAL}
-                |
-                {CITY_TOKENS}
-                |
-                {UNIT}
-                |
-                [A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\.\-']{{2,}}
-            )
-        ){{0,8}}
+                (?:\s*,\s*|\s+)
+                (?:
+                    {cfg.neighborhood}\s+{cfg.street_name}
+                    |
+                    {cfg.postal}
+                    |
+                    {cfg.city_tokens}
+                    |
+                    {cfg.unit}
+                    |
+                    [A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9\.\-']{{2,}}
+                )
+            ){{0,8}}
+        )
+        """,
+        re.IGNORECASE | re.VERBOSE,
     )
-    """,
-    re.IGNORECASE | re.VERBOSE
-)
 
-# 3) Emoji + general location line (when no street types are used)
-
-EMOJI_SOFT_RE = re.compile(
-    rf"""
-    (?P<cand>
-        {LOCATION_EMOJI}\s*
-        [^\n;]{{10,180}}
+    # 3) Emoji + general location line
+    emoji_soft = re.compile(
+        rf"""
+        (?P<cand>
+            {cfg.location_emoji}\s*
+            [^\n;]{{10,180}}
+        )
+        """,
+        re.IGNORECASE | re.VERBOSE,
     )
-    """,
-    re.IGNORECASE | re.VERBOSE
-)
 
-# 4) Cross-street/Between pattern (when no house number)
-CROSS_RE = re.compile(
-    rf"""
-    (?P<cand>
-        \b{CROSS_WORDS}\b
-        [^\n;]{{10,160}}
+    # 4) Cross-street / Between pattern
+    cross_streets = re.compile(
+        rf"""
+        (?P<cand>
+            \b{cfg.cross_words}\b
+            [^\n;]{{10,160}}
+        )
+        """,
+        re.IGNORECASE | re.VERBOSE,
     )
-    """,
-    re.IGNORECASE | re.VERBOSE
-)
+
+    # Place: "POI | CITY"
+    poi_city = re.compile(
+        r"""
+        (?P<poi>
+            (?:[A-ZÁÉÍÓÚÜÑ][\wÁÉÍÓÚÜÑáéíóúüñ\.\-&'’]+
+            (?:\s+[A-ZÁÉÍÓÚÜÑ0-9][\wÁÉÍÓÚÜÑáéíóúüñ\.\-&'’]+){0,8})
+        )
+        \s*(?:\||-|—|–|·|,)\s*
+        (?P<city>[A-Za-zÁÉÍÓÚÜÑáéíóúüñ\. ]{2,40})
+        """,
+        re.VERBOSE,
+    )
+
+    cue_location = re.compile(
+        rf"""
+        (?P<cue>
+            {cfg.location_emoji}\s*|
+            (?:{"|".join(cfg.location_cues)})
+        )
+        \s*[:\-]?\s*
+        (?P<loc>
+            [^\n\.;!\?\|]{{3,120}}
+        )
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    hashtag_city = re.compile(r"#(?P<city>[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{2,20})", re.IGNORECASE)
+
+    compiled = _CompiledPatterns(
+        street_number=street_number,
+        emoji_street_number=emoji_street_number,
+        cross_streets=cross_streets,
+        emoji_soft=emoji_soft,
+        poi_city=poi_city,
+        cue_location=cue_location,
+        hashtag_city=hashtag_city,
+        city_re=_build_city_regex(list(cfg.city_token_list)),
+    )
+    _COMPILED_CACHE[cfg.language] = compiled
+    return compiled
 
 
-# Helpers
+# =========================
+# Address extraction internals
+# =========================
 
-def expand_with_emoji(text: str, start: int, max_back: int = 12) -> int:
-    """If a location emoji appears immediately before the match, include it."""
+def _expand_with_emoji(text: str, start: int, location_emoji: str, max_back: int = 12) -> int:
     back = max(0, start - max_back)
     prefix = text[back:start]
-    m = re.search(rf"{LOCATION_EMOJI}\s*$", prefix)
+    m = re.search(rf"{location_emoji}\s*$", prefix)
     return back + m.start() if m else start
 
-def _score(s: str) -> float:
-    s_low = s.lower()
-    score = 0.0
 
-    # emoji boost
-    if re.search(LOCATION_EMOJI, s):
-        score += 2.5
-
-    # structural cues
-    if re.search(rf"\b{STREET_TYPES}\b", s_low):
-        score += 3
-    if re.search(rf"\b(?:{NUM})\b", s_low):
-        score += 3
-    if re.search(rf"\b{NEIGHBORHOOD}\b", s_low):
-        score += 2
-    if re.search(POSTAL, s_low):
-        score += 2
-    if re.search(CITY_TOKENS, s_low):
-        score += 1
-    if re.search(rf"\b{CROSS_WORDS}\b", s_low):
-        score += 1
-    if re.search(rf"\b(?:depto|departamento|int|interior|piso|torre|edif|edificio|local|mz|manzana|lote|km)\b", s_low):
-        score += 0.5
-
-    # length sanity
-    L = len(s.strip())
-    if L < 18:
-        score -= 2
-    elif L > 240:
-        score -= 1
-
-    return score
-
-def _expand_forward(text: str, start: int, end: int, extra_chars: int = 140) -> Tuple[int, int]:
-    """Expand forward to include trailing comma-separated tokens but stop at STOP_RE or max length."""
+def _expand_forward(text: str, start: int, end: int, stop_re: Pattern, extra_chars: int) -> Tuple[int, int]:
     max_end = min(len(text), end + extra_chars)
     tail = text[end:max_end]
-    stop = STOP_RE.search(tail)
+    stop = stop_re.search(tail)
     if stop:
         max_end = end + stop.start()
     return start, max_end
 
-def _dedupe(matches: List[AddressMatch]) -> List[AddressMatch]:
-    """Dedupe by overlapping spans: keep higher score if overlaps heavily."""
+
+def _address_score(s: str, cfg: LanguageConfig) -> float:
+    s_low = s.lower()
+    score = 0.0
+
+    cues_alt = "|".join(f"(?:{cue})" for cue in cfg.location_cues)
+    LOCATION_CUES_RE =  re.compile(rf"(?:{cues_alt})", re.IGNORECASE)
+
+    if re.search(cfg.location_emoji, s):
+        score += 2.5
+    if re.search(LOCATION_CUES_RE, s):
+        occurrences = sum(1 for _ in LOCATION_CUES_RE.finditer(s))
+        score += 2.0 #* min(occurrences, 3)
+    if re.search(LOCATION_CUES_RE, s_low):
+        occurrences = sum(1 for _ in LOCATION_CUES_RE.finditer(s_low))
+        score += 2.0 #* min(occurrences, 3)
+    if re.search(rf"\b{cfg.street_types}\b", s_low):
+        score += 3.0
+    if re.search(rf"\b(?:{cfg.num})\b", s_low):
+        score += 3.0
+    if re.search(rf"\b{cfg.neighborhood}\b", s_low):
+        score += 2.0
+    if re.search(cfg.postal, s_low):
+        score += 2.0
+    if re.search(cfg.city_tokens, s_low):
+        score += 1.0
+    if re.search(rf"\b{cfg.cross_words}\b", s_low):
+        score += 1.0
+    if re.search(r"\b(?:depto|departamento|int|interior|piso|torre|edif|edificio|local|mz|manzana|lote|km)\b", s_low):
+        score += 0.5
+
+    L = len(s.strip())
+    if L < 10:
+        score -= 3.0
+    if L >= 10 and L<18 :
+        score -= 2.0
+    elif L > 240:
+        score -= 3.0
+
+    return score
+
+
+def _dedupe_address(matches: List[AddressMatch]) -> List[AddressMatch]:
     if not matches:
         return []
 
-    matches = sorted(matches, key=lambda x: (x.span[0], -(x.span[1]-x.span[0]), -x.score))
+    matches = sorted(matches, key=lambda x: (x.span[0], -(x.span[1] - x.span[0]), -x.score))
     kept: List[AddressMatch] = []
 
-    def overlap(a: Tuple[int, int], b: Tuple[int, int]) -> float:
+    def overlap_ratio(a: Tuple[int, int], b: Tuple[int, int]) -> float:
         inter = max(0, min(a[1], b[1]) - max(a[0], b[0]))
         union = max(a[1], b[1]) - min(a[0], b[0])
         return inter / union if union else 0.0
@@ -727,7 +948,7 @@ def _dedupe(matches: List[AddressMatch]) -> List[AddressMatch]:
     for m in matches:
         replaced = False
         for i, k in enumerate(kept):
-            if overlap(m.span, k.span) >= 0.55:
+            if overlap_ratio(m.span, k.span) >= 0.55:
                 if m.score > k.score:
                     kept[i] = m
                 replaced = True
@@ -738,214 +959,58 @@ def _dedupe(matches: List[AddressMatch]) -> List[AddressMatch]:
     return sorted(kept, key=lambda x: x.score, reverse=True)
 
 
-# Main API: simultaneous matching across patterns
-
-def extract_addresses(text: str, top_k: int = 3, min_score: float = 5.0) -> List[AddressMatch]:
-    """
-    Simultaneously runs multiple patterns and returns top-k scored matches
-    with original substring spans.
-    """
+def extract_addresses(
+    text: str,
+    cfg: LanguageConfig,
+    top_k: int = 3,
+    min_score: float = 5.0,
+) -> List[AddressMatch]:
     if not text or not text.strip():
         return []
 
-    patterns: List[Tuple[str, re.Pattern]] = [
-        ("street_number", CANDIDATE_RE),
-        ("emoji_street_number", EMOJI_CANDIDATE_RE),
-        ("cross_streets", CROSS_RE),
-        ("emoji_soft", EMOJI_SOFT_RE),
+    rx = _compile_patterns(cfg)
+
+    patterns: List[Tuple[str, Pattern]] = [
+        ("emoji_street_number", rx.emoji_street_number),
+        ("street_number", rx.street_number),
+        ("cross_streets", rx.cross_streets),
+        ("emoji_soft", rx.emoji_soft),
     ]
 
     found: List[AddressMatch] = []
 
-    for rule_name, rx in patterns:
-        for m in rx.finditer(text):
+    for rule_name, pat in patterns:
+        for m in pat.finditer(text):
             start, end = m.start("cand"), m.end("cand")
 
-            # include emoji if immediately before match
-            start = expand_with_emoji(text, start)
+            start = _expand_with_emoji(text, start, cfg.location_emoji)
 
-            # expand forward to catch trailing tokens (esp. after a strong street match)
             if rule_name in ("street_number", "emoji_street_number"):
-                start, end = _expand_forward(text, start, end, extra_chars=160)
+                start, end = _expand_forward(text, start, end, cfg.stop_re, extra_chars=160)
             else:
-                start, end = _expand_forward(text, start, end, extra_chars=80)
+                start, end = _expand_forward(text, start, end, cfg.stop_re, extra_chars=80)
 
             cand = text[start:end].strip(" ,.;:-")
-            score = _score(cand)
+            score = _address_score(cand, cfg)
 
             # Down-weight the soft emoji rule unless it contains strong cues
-            if rule_name == "emoji_soft" and score < 6:
+            if rule_name == "emoji_soft" and score < 6.0:
                 score -= 1.5
 
             found.append(AddressMatch(text=cand, span=(start, end), score=score, rule=rule_name))
 
-    # Dedupe and rank
-    ranked = _dedupe(found)
-    ranked = [m for m in ranked if m.score >= min_score][:top_k]
-    return ranked
+    ranked = _dedupe_address(found)
+    return [m for m in ranked if m.score >= min_score][:top_k]
 
 
-# place_detector.py
-import re
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+# =========================
+# Place detection internals
+# =========================
 
-
-@dataclass
-class PlaceMatch:
-    text: str
-    span: Tuple[int, int]      # (start, end) in original string
-    kind: str                 # "POI" | "CITY" | "PLACE"
-    rule: str                 # which rule matched (debug)
-
-
-# -----------------------------
-# Configurable lexicons
-# -----------------------------
-DEFAULT_CITY_TOKENS = [
-    # Mexico common
-    "CDMX", "Ciudad de México", "México DF", "Mexico DF", "DF",
-    "Guadalajara", "GDL", "Monterrey", "MTY", "Puebla", "Querétaro", "Queretaro",
-    "Tijuana", "Mérida", "Merida", "Cancún", "Cancun", "Toluca",
-]
-
-# Keywords that strongly indicate a location mention nearby
-LOCATION_CUES = [
-    r"direcci[oó]n", r"ubicaci[oó]n", r"est[aá]\s+en", r"queda\s+en", r"estamos\s+en",
-    r"nos\s+vemos\s+en", r"visita", r"ven\s+a", r"en\b", r"por\b", r"sobre\b", r"explora"
-    r"descubre"
-]
-
-# Emoji anchors often used in captions
-LOCATION_EMOJI = r"(?:📍|📌|🗺️|🧭|🏠|🏢|🏬|🏪|🏨|🏫|🏥)"
-
-
-# -----------------------------
-# Helper: build safe city regex
-# -----------------------------
-def _build_city_regex(city_tokens: List[str]) -> re.Pattern:
-    # Sort longer first to avoid partial matches (Ciudad de México vs México)
-    toks = sorted(city_tokens, key=len, reverse=True)
-    # Escape user tokens safely
-    alts = "|".join(re.escape(t) for t in toks)
-    return re.compile(rf"\b(?:{alts})\b", re.IGNORECASE)
-
-
-# -----------------------------
-# Core patterns
-# -----------------------------
-# 1) "POI | CITY" or "POI - CITY" or "POI · CITY" or "POI, CITY"
-# Example: "El Taco | CDMX"
-POI_CITY_RE = re.compile(
-    r"""
-    (?P<poi>                                   # POI: allow Title-ish phrases
-        (?:[A-ZÁÉÍÓÚÜÑ][\wÁÉÍÓÚÜÑáéíóúüñ\.\-&'’]+
-        (?:\s+[A-ZÁÉÍÓÚÜÑ0-9][\wÁÉÍÓÚÜÑáéíóúüñ\.\-&'’]+){0,8})
-    )
-    \s*(?:\||-|—|–|·|,)\s*
-    (?P<city>[A-Za-zÁÉÍÓÚÜÑáéíóúüñ\. ]{2,40})
-    """,
-    re.VERBOSE
-)
-
-# 2) Cue-based: "en X", "dirección: X", "está en X", "visita X"
-# We capture a "location phrase" after the cue up to punctuation/linebreak.
-CUE_LOCATION_RE = re.compile(
-    rf"""
-    (?P<cue>
-        {LOCATION_EMOJI}\s*|
-        (?:{"|".join(LOCATION_CUES)})
-    )
-    \s*[:\-]?\s*
-    (?P<loc>
-        [^\n\.;!\?\|]{{3,120}}                   # capture until hard punctuation
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE
-)
-
-# 3) Hashtag / mention city: "#cdmx", "en CDMX"
-HASHTAG_CITY_RE = re.compile(r"#(?P<city>[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{2,20})", re.IGNORECASE)
-
-
-# -----------------------------
-# Main API
-# -----------------------------
-def detect_places(
-    text: str,
-    city_tokens: Optional[List[str]] = None,
-    max_results: int = 10
-) -> List[PlaceMatch]:
-    """
-    Detect place-like substrings using:
-      - POI|CITY title pattern ("El Taco | CDMX")
-      - cue-based segments ("dirección:", "está en", "visita", "📍")
-      - city token hits (optional, improves precision)
-    Returns spans in original text.
-    """
-    if not text or not text.strip():
-        return []
-
-    city_tokens = city_tokens or DEFAULT_CITY_TOKENS
-    city_re = _build_city_regex(city_tokens)
-
-    matches: List[PlaceMatch] = []
-
-    # Rule 1: cue-based location phrases
-    for m in CUE_LOCATION_RE.finditer(text):
-        loc = m.group("loc").strip(" ,|-")
-        span = (m.start("loc"), m.end("loc"))
-
-        # If the captured phrase contains a known city token, mark as CITY/PLACE
-        if city_re.search(loc):
-            kind = "CITY"
-        else:
-            kind = "PLACE"
-
-        matches.append(PlaceMatch(text=loc, span=span, kind=kind, rule="cue_location"))
-
-    # Rule 2: POI | CITY
-    for m in POI_CITY_RE.finditer(text):
-        poi = m.group("poi").strip(" -|,·—–")
-        city_raw = m.group("city").strip(" -|,·—–")
-
-        # Validate city with city lexicon if possible (otherwise accept)
-        kind = "POI"
-        if city_re.search(city_raw):
-            # Use the matched city token span instead of full city_raw if you prefer
-            kind = "POI"
-
-        matches.append(PlaceMatch(
-            text=f"{poi}",
-            span=(m.start(), m.end()),
-            kind=kind,
-            rule="poi_city"
-        ))
-
-
-    # Rule 3: hashtag city (useful in reels captions)
-    for m in HASHTAG_CITY_RE.finditer(text):
-        tag = m.group("city")
-        # only keep if it matches a known city token (or common short codes)
-        if city_re.search(tag) or tag.lower() in {"cdmx", "gdl", "mty"}:
-            matches.append(PlaceMatch(
-                text="#" + tag,
-                span=(m.start(), m.end()),
-                kind="CITY",
-                rule="hashtag_city"
-            ))
-
-    # Post-process: dedupe heavily overlapping spans, prefer earlier & longer
-    matches = _dedupe_overlaps(matches)
-
-    return matches[:max_results]
-
-
-def _dedupe_overlaps(matches: List[PlaceMatch]) -> List[PlaceMatch]:
+def _dedupe_place_overlaps(matches: List[PlaceMatch]) -> List[PlaceMatch]:
     if not matches:
         return []
 
-    # Prefer longer spans, then earlier
     matches_sorted = sorted(matches, key=lambda x: (-(x.span[1] - x.span[0]), x.span[0]))
     kept: List[PlaceMatch] = []
 
@@ -957,8 +1022,522 @@ def _dedupe_overlaps(matches: List[PlaceMatch]) -> List[PlaceMatch]:
             continue
         kept.append(m)
 
-    # Return in reading order by kind
-    return sorted(kept, key=lambda x: x.kind, reverse=True)
+    # Keep POI/PLACE/CITY before weaker ones; then in reading order
+    kind_rank = {"POI": 0, "PLACE": 1, "CITY": 2}
+    return sorted(kept, key=lambda x: (kind_rank.get(x.kind, 9), x.span[0]))
+
+
+def detect_places(
+    text: str,
+    cfg: LanguageConfig,
+    max_results: int = 10,
+) -> List[PlaceMatch]:
+    if not text or not text.strip():
+        return []
+
+    rx = _compile_patterns(cfg)
+    matches: List[PlaceMatch] = []
+
+    # Rule 1: cue-based location phrases
+    for m in rx.cue_location.finditer(text):
+        loc = m.group("loc").strip(" ,|-")
+        span = (m.start("loc"), m.end("loc"))
+        kind = "CITY" if rx.city_re.search(loc) else "PLACE"
+        matches.append(PlaceMatch(text=loc, span=span, kind=kind, rule="cue_location"))
+
+    # Rule 2: POI | CITY
+    for m in rx.poi_city.finditer(text):
+        poi = m.group("poi").strip(" -|,·—–")
+        city_raw = m.group("city").strip(" -|,·—–")
+        # Validate city lightly if possible; keep POI regardless
+        _ = rx.city_re.search(city_raw)  # intentional side-effect-free validation
+        matches.append(PlaceMatch(
+            text=poi,
+            span=(m.start(), m.end()),
+            kind="POI",
+            rule="poi_city",
+        ))
+
+    # Rule 3: hashtag city
+    for m in rx.hashtag_city.finditer(text):
+        tag = m.group("city")
+        if rx.city_re.search(tag) or tag.lower() in {"cdmx", "gdl", "mty"}:
+            matches.append(PlaceMatch(
+                text="#" + tag,
+                span=(m.start(), m.end()),
+                kind="CITY",
+                rule="hashtag_city",
+            ))
+
+    matches = _dedupe_place_overlaps(matches)
+    return matches[:max_results]
+
+
+def _place_score(pm: PlaceMatch, cfg: LanguageConfig) -> float:
+    """
+    Place scoring is intentionally weaker than address scoring.
+    We only allow place to win when address evidence is insufficient.
+    """
+    score = 0.0
+    s = pm.text.strip()
+    s_low = s.lower()
+
+    cues_alt = "|".join(f"(?:{cue})" for cue in cfg.location_cues)
+    LOCATION_CUES_RE =  re.compile(rf"(?:{cues_alt})", re.IGNORECASE)
+
+    # Reward patter importance 
+    if re.search(cfg.location_emoji, s):
+        score += 3.0
+    
+    if re.search(LOCATION_CUES_RE, s):
+        occurrences = sum(1 for _ in LOCATION_CUES_RE.finditer(s))
+        score += 2.0 #* min(occurrences, 3)
+
+    if re.search(LOCATION_CUES_RE, s_low):
+        occurrences = sum(1 for _ in LOCATION_CUES_RE.finditer(s_low))
+        score += 2.0 #* min(occurrences, 3)
+
+
+    if pm.kind == "POI":
+        score += 3.0
+    elif pm.kind == "CITY":
+        score += 2.0
+    else:
+        score += 1.0
+
+    L = len(s)
+    if L < 4:
+        score -= 1.5
+    elif L > 160:
+        score -= 0.5
+
+    # Penalize strings that look like marketing fragments rather than locations
+    if re.search(r"\b(?:promo|gratis|descuento|reserv(a|as)|boletos|entradas)\b", s.lower()):
+        score -= 0.75
+
+    return score
+
+
+# =========================
+# Unified public API
+# =========================
+
+def best_location_label_from_text(
+    text: str,
+    cfg: Optional[LanguageConfig] = None,
+     *,
+    min_address_score: float = 7.0,
+    min_place_score: float = 3.0,
+) -> LocationLabelResult:
+    """
+    Priority order:
+      1) Strong address formats (emoji + street + number; street + number)
+      2) Secondary address (cross-streets; emoji_soft)
+      3) Place-name patterns (POI|CITY; cue-based; hashtag city)
+
+    `min_address_score` is set higher than the internal extractor default to enforce
+    "strong priority" to address structure.
+    """
+    cfg = cfg or default_spanish_config()
+
+    text = text.lower()
+
+    if not text or not text.strip():
+        return LocationLabelResult(label="", kind="NONE", score=0.0, rule="empty", span=(0, 0))
+
+    # 1) Addresses (strongly preferred)
+    addr = extract_addresses(text, cfg, top_k=5, min_score=0.0)  # filter here with custom logic
+    if addr:
+        best_addr = addr[0]
+        if best_addr.score >= min_address_score:
+            return LocationLabelResult(
+                label=best_addr.text,
+                kind="ADDRESS",
+                score=best_addr.score,
+                rule=best_addr.rule,
+                span=best_addr.span,
+            )
+
+    # 2) If address exists but is weak, we still prefer it unless *very* weak
+    if addr:
+        best_addr = addr[0]
+        # If it has street+num evidence, keep it even if slightly below threshold
+        has_struct = (
+            re.search(rf"\b{cfg.street_types}\b", best_addr.text.lower()) is not None
+            and re.search(rf"\b(?:{cfg.num})\b", best_addr.text.lower()) is not None
+        )
+        if has_struct and best_addr.score >= (min_address_score - 1.5):
+            return LocationLabelResult(
+                label=best_addr.text,
+                kind="ADDRESS",
+                score=best_addr.score,
+                rule=best_addr.rule,
+                span=best_addr.span,
+            )
+
+    # 3) Places as fallback
+    places = detect_places(text, cfg, max_results=10)
+    if places:
+        scored = [(p, _place_score(p, cfg)) for p in places]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        best_place, p_score = scored[0]
+        if p_score >= min_place_score:
+            return LocationLabelResult(
+                label=best_place.text,
+                kind="PLACE",
+                score=p_score,
+                rule=best_place.rule,
+                span=best_place.span,
+            )
+
+    # 4) If nothing passes thresholds, return best available weak signal
+    if addr:
+        best_addr = addr[0]
+        return LocationLabelResult(
+            label=best_addr.text,
+            kind="ADDRESS",
+            score=best_addr.score,
+            rule=best_addr.rule,
+            span=best_addr.span,
+        )
+
+    if places:
+        best_place = places[0]
+        return LocationLabelResult(
+            label=best_place.text,
+            kind="PLACE",
+            score=_place_score(best_place, cfg),
+            rule=best_place.rule,
+            span=best_place.span,
+        )
+
+    return LocationLabelResult(label="", kind="NONE", score=0.0, rule="no_match", span=(0, 0))
+
+
+
+
+
+# =========================
+# Optional: config for future languages
+# =========================
+
+def build_language_config(
+    language: str,
+    *,
+    location_emoji: str,
+    street_types: str,
+    street_name: str,
+    num: str,
+    neighborhood: str,
+    postal: str,
+    city_tokens: str,
+    cross_words: str,
+    unit: str,
+    city_token_list: List[str],
+    location_cues: List[str],
+    stop_re: Optional[Pattern] = None,
+) -> LanguageConfig:
+    return LanguageConfig(
+        language=language,
+        location_emoji=location_emoji,
+        street_types=street_types,
+        street_name=street_name,
+        num=num,
+        neighborhood=neighborhood,
+        postal=postal,
+        city_tokens=city_tokens,
+        cross_words=cross_words,
+        unit=unit,
+        city_token_list=tuple(city_token_list),
+        location_cues=tuple(location_cues),
+        stop_re=stop_re
+        or re.compile(
+            r"(?:\n|\b(?:tel|phone|whats|price|hours|instagram|ig|facebook|link|shipping)\b|https?://)",
+            re.IGNORECASE,
+        ),
+    )
+
+
+
+import re
+import unicodedata
+from dataclasses import dataclass
+from typing import Iterable, Optional, Pattern, Sequence
+
+
+@dataclass(frozen=True)
+class TextFormatConfig:
+    """
+    Configuration for robust formatting/normalization of an address/place label.
+    All patterns are applied in the order documented in `format_place_or_address()`.
+    """
+    language: str = "es"
+
+    # Tokens that are typically connective/noise when isolated (caption-like text).
+    # Use short, high-frequency words; keep them conservative to avoid deleting meaning.
+    connectors: Sequence[str] = (
+        "en", "de", "del", "la", "las", "el", "los", "y", "e", "a", "al", "por",
+        "con", "sin", "para", "sobre", "entre", "frente", "cerca", "hacia", "desde",
+    )
+
+    # Extra “junk” tokens often seen in scraped captions / CTAs.
+    # Keep conservative and only remove when they appear as standalone words.
+    # Disclaimer and hard coded captions in web displays 
+    junk_tokens: Sequence[str] = (
+        "link", "bio", "dm", "inbox", "whatsapp", "wa", "ig", "instagram", "facebook",
+        "maps", "google", "ubicacion", "ubicación", "direccion", "dirección",
+        "este es un resumen del contenido generado con ia y no busca ofrecer un contexto basado en hechos", 
+        "si crees que puede contener algún error, informanos en: tomentarios y ayuda: tiktok",
+    )
+
+    junk_description_tokens: Sequence[str] = (
+        "link", "bio", "dm", "inbox", "whatsapp", "wa", "ig", "instagram", "facebook",
+        r"(?:bonit[oa]s?|lind[oa]s?|hermos[oa]s?|preci[oó]s[oa]s?|bell[oa]s?|encantador(?:a|es)?|espectacular(?:es)?|incre[ií]ble(?:s)?|maravillos[oa]s?|impresionante(?:s)?|perfect[oa]s?|m[aá]gic[oa]s?|grande(?:s)?|enorme(?:s)?|gigante(?:s)?|inmens[oa]s?|peque[nñ][oa]s?|ampli[oa]s?|extens[oa]s?|el\s+m[aá]s\s+grande\s+de|el\s+m[aá]s\s+importante\s+de|uno\s+de\s+los\s+m[aá]s\s+grandes|mejor(?:es)?|excelente(?:s)?|imperdible(?:s)?|recomendado(?:s)?|favorito(?:s)?|top|ic[oó]nic[oa]s?|emblem[aá]tic[oa]s?|legendari[oa]s?|famos[oa]s?|inolvidable(?:s)?|[uú]nic[oa]s?|especial(?:es)?|so[nñ]ad[oa]s?|rom[aá]ntic[oa]s?|relajante(?:s)?|nuevo(?:s)?|reci[eé]n\s+abierto(?:s)?|moderno(?:s)?|tradicional(?:es)?|hist[oó]rico(?:s)?|cl[aá]sic[oa]s?|antiguo(?:s)?|de\s+moda|tendencia|viral(?:es)?|instagrameable(?:s)?|perfecto\s+para\s+fotos|ideal\s+para|el\s+lugar\s+perfecto\s+para|incre[ií]blemente|sumamente|realmente|muy|s[uú]per|mega|ultra)",
+        "mas", "menos", "mejor", "peor", "mayor", "menor", "el peor de", "mas bonito de", "mas grande de",
+        "más bonito de", "más grande de","más"
+  
+    )
+
+    # If True: remove leading connectors (e.g., "en ...", "de ...") repeatedly.
+    strip_leading_connectors: bool = True
+
+    # If True: remove trailing connectors (rare but can occur) repeatedly.
+    strip_trailing_connectors: bool = True
+
+    # If True: drop isolated single-letter tokens (e.g. "A", "B") unless whitelisted.
+    drop_isolated_letters: bool = True
+
+    # Keep letters that can be meaningful in addresses (e.g. "Int A", "Torre B", "#12A")
+    isolated_letter_whitelist: Sequence[str] = ("a", "b", "c")  # conservative default
+
+    # Unicode normalization
+    normalize_unicode_form: str = "NFKC"  # stable for user-facing text
+
+    # If True: collapse whitespace aggressively.
+    collapse_whitespace: bool = True
+
+    # If True: normalize punctuation spacing and dedupe repeated punctuation.
+    normalize_punctuation: bool = True
+
+    # If True: title-case words (keeps acronyms/codes). Not always desired; default False.
+    title_case: bool = False
+
+    # If True: preserve accents as-is (recommended). If False: strip accents.
+    keep_accents: bool = True
+
+def unique_words_preserve_case(s: str) -> list[str]:
+    seen = set()
+    out = []
+    for w in re.findall(r"\b\w+\b", s):
+        key = w.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(w)
+    return " ".join(out)
+
+
+def remove_connectors_and_junk(text: str, cfg) -> str:
+    """
+    Removes ALL occurrences of connectors and junk tokens (incl. regex fragments) from `text`,
+    then normalizes whitespace/punctuation for place/address cleaning.
+
+    Assumes:
+      - cfg.connectors is a tuple/list of literal tokens (strings)
+      - cfg.junk_tokens is a tuple/list of regex fragments (strings), as in your current design
+    """
+    if not text:
+        return ""
+
+    s = str(text)
+
+    # Basic normalize: whitespace + common wrappers
+    s = s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    s = re.sub(r"\s{2,}", " ", s).strip().strip(" ,;:.-“”\"'()[]{}")
+
+    # Build alternations
+    junk_alt = "|".join(f"(?:{t})" for t in cfg.junk_description_tokens if t and t.strip())  # already regex
+
+    # Remove ALL occurrences (not just leading/trailing)
+    if junk_alt:
+        s = re.sub(rf"(?i)\b(?:{junk_alt})\b", " ", s)
+
+        # Hashtags: remove #<junk> plus optionally orphan '#'
+        s = re.sub(rf"(?i)(?:^|\s)#(?:{junk_alt})\b", " ", s)
+        s = re.sub(r"(?i)(?:^|\s)#(?=\s|$)", " ", s)
+
+    # Cleanup punctuation & whitespace after removals
+    s = re.sub(r"\s+([,;:.])", r"\1", s)
+    s = re.sub(r"([,;:.])\s*", r"\1 ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip(" ,;:.-“”\"'()[]{}")
+
+    # Optional: if you also want to drop leftover empty separators like ", ,"
+    s = re.sub(r"(?:\s*,\s*){2,}", ", ", s).strip(" ,")
+
+    return s
+
+
+
+def format_place_or_address(
+    text: str,
+    kind: str, 
+    city:str,
+    cfg: Optional[TextFormatConfig] = None,
+) -> str:
+    """
+    Production-grade formatter for strings that are expected to represent a place or address.
+
+    Goals:
+      - Normalize unicode and spacing
+      - Remove caption-like connectors (language-specific) at edges
+      - Remove standalone junk tokens (e.g., "link", "bio", "ubicación") as standalone words
+      - Drop isolated letters that are likely noise (with an allowlist)
+      - Clean punctuation and separators without destroying address semantics
+
+    This is intentionally conservative: it tries not to remove informative content.
+    """
+    if text is None:
+        return ""
+
+    cfg = cfg or TextFormatConfig()
+
+    s = str(text)
+
+    # 1) Unicode normalization (also fixes “full-width” variants, compatibility chars)
+    s = unicodedata.normalize(cfg.normalize_unicode_form, s)
+
+    # 2) Strip control characters and normalize newlines/tabs to spaces
+    #    Keep only printable-ish characters; remove Cc/Cf categories.
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in {"Cc", "Cf"})
+    s = s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+
+    # 3) Trim outer quotes / bullets / common wrappers
+    s = s.strip().strip("“”\"'`´•·-–—|:")
+
+    if not s:
+        return ""
+
+    # 4) Optional accent stripping (generally not recommended for addresses in ES)
+    if not cfg.keep_accents:
+        s = "".join(
+            ch for ch in unicodedata.normalize("NFD", s)
+            if unicodedata.category(ch) != "Mn"
+        )
+
+    # 5) Normalize common separators/spaces around punctuation
+    #    Convert multiple separators to a single standardized form.
+    if cfg.normalize_punctuation:
+        # Normalize fancy dashes to hyphen, pipes/bullets to commas
+        s = s.replace("–", "-").replace("—", "-").replace("·", ",").replace("|", ",")
+        # Remove spaces before punctuation, standardize after punctuation
+        s = re.sub(r"\s+([,;:.])", r"\1", s)
+        s = re.sub(r"([,;:.])\s*", r"\1 ", s)
+        # Collapse repeated punctuation
+        s = re.sub(r"([,;:.])(?:\s*\1)+", r"\1", s)
+        # Trim trailing punctuation leftovers
+        s = s.strip(" ,;:.")
+
+    # 6) Collapse whitespace
+    if cfg.collapse_whitespace:
+        s = re.sub(r"\s{2,}", " ", s).strip()
+
+    if not s:
+        return ""
+
+    # Build reusable word-boundary patterns
+    def _word_alt(tokens: Sequence[str]) -> str:
+        # Escape literal tokens; allow accents already embedded.
+        toks = [re.escape(t) for t in tokens if t and t.strip()]
+        return "|".join(toks) if toks else r"(?!x)x"
+
+    connectors_alt = _word_alt(cfg.connectors)
+    junk_alt = _word_alt(cfg.junk_tokens)
+
+    # 7) Remove standalone junk tokens (only when they appear as whole words)
+    if cfg.junk_tokens:
+        s = re.sub(rf"(?i)\b(?:{junk_alt})\b", "", s)
+        s = re.sub(r"\s{2,}", " ", s).strip(" ,;:.-")
+        # Remove any hashtag token (#word, #word123)
+        s = re.sub(r"(?i)(?:^|\s)#\w+", "", s)
+
+
+    # 8) Remove leading/trailing connectors repeatedly (e.g. "en", "de", "del", etc.)
+    if cfg.strip_leading_connectors and cfg.connectors:
+        # Leading: "en la", "de", etc. Repeat until stable.
+        prev = None
+        while prev != s:
+            prev = s
+            s = re.sub(rf"(?i)^(?:\b(?:{connectors_alt})\b\s+)+", "", s).strip()
+
+    if cfg.strip_trailing_connectors and cfg.connectors:
+        prev = None
+        while prev != s:
+            prev = s
+            s = re.sub(rf"(?i)\s+(?:\b(?:{connectors_alt})\b)+$", "", s).strip()
+
+    # 9) Token-level cleanup: drop isolated letters when likely noise
+    if cfg.drop_isolated_letters:
+        whitelist = {w.lower() for w in (cfg.isolated_letter_whitelist or [])}
+
+        tokens = s.split(" ")
+        cleaned = []
+        for i, tok in enumerate(tokens):
+            t = tok.strip()
+
+            # Keep empty tokens out
+            if not t:
+                continue
+
+            # Detect single-letter token (alphabetic) like "A" or "b"
+            if len(t) == 1 and t.isalpha():
+                if t.lower() in whitelist:
+                    cleaned.append(t)
+                    continue
+
+                # Heuristic: keep if next token suggests it's meaningful (e.g., "Torre B", "Int A")
+                # If previous token is a unit-ish cue, keep it.
+                prev_tok = cleaned[-1].lower() if cleaned else ""
+                next_tok = tokens[i + 1].lower() if i + 1 < len(tokens) else ""
+
+                if prev_tok in {"int", "interior", "depto", "departamento", "torre", "edif", "edificio", "local", "bloque"}:
+                    cleaned.append(t)
+                    continue
+                if next_tok and re.fullmatch(r"\d{1,6}", next_tok):
+                    # "A 12" is usually noise, drop "A"
+                    continue
+
+                # Default: drop isolated letter
+                continue
+
+            cleaned.append(t)
+
+        s = " ".join(cleaned).strip()
+
+    # 10) Final punctuation/space normalization pass
+    if cfg.normalize_punctuation:
+        s = re.sub(r"\s+([,;:.])", r"\1", s)
+        s = re.sub(r"([,;:.])\s*", r"\1 ", s)
+        s = re.sub(r"\s{2,}", " ", s).strip(" ,;:.")
+
+    # 11) Optional title-casing (keeps all-caps acronyms / short codes)
+    if cfg.title_case and s:
+        def smart_title(word: str) -> str:
+            if re.fullmatch(r"[A-Z0-9]{2,}", word):  # acronyms / codes
+                return word
+            # Keep tokens containing digits as-is except first char
+            if any(ch.isdigit() for ch in word):
+                return word[:1].upper() + word[1:]
+            return word[:1].upper() + word[1:].lower()
+
+        s = " ".join(smart_title(w) for w in s.split())
+
+    # Mantain unique words for address formatting 
+    s = unique_words_preserve_case(s)
+
+    # Place formal address for city if not address 
+    if kind == "PLACE":
+        s = s.replace(city,"") + f", {city}"
+    
+    return s
 
 
 
